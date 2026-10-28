@@ -6,6 +6,32 @@ from pathlib import Path
 import io
 
 # -----------------------------------------------------------------------------
+# Authentication Setup
+# -----------------------------------------------------------------------------
+st.set_page_config(page_title="Attendance Data Manager", layout="wide")
+
+if 'authenticated' not in st.session_state:
+    st.session_state['authenticated'] = False
+
+if not st.session_state['authenticated']:
+    st.title("🔒 Login Required")
+    st.write("Please enter your credentials to access the Attendance Manager.")
+    
+    with st.form("login_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submit = st.form_submit_button("Login")
+        
+        if submit:
+            if username == "admin" and password == "xyz1234":
+                st.session_state['authenticated'] = True
+                st.rerun()
+            else:
+                st.error("Invalid username or password.")
+                
+    st.stop() # This halts the script here if the user is not authenticated
+
+# -----------------------------------------------------------------------------
 # Database Setup
 # -----------------------------------------------------------------------------
 def get_db_connection(db_name="attendance_records.db"):
@@ -46,13 +72,11 @@ def process_excel_file(file_obj, file_name_str, file_path_str, conn):
     }
 
     try:
-        # Read without headers first to locate the actual header row
         temp_df = pd.read_excel(file_obj, header=None)
         
         header_row_index = -1
         standardized_rename_map = {}
         
-        # Scan row by row to find headers
         for i, row in temp_df.iterrows():
             row_vals = [str(x).strip().upper() for x in row.values]
             current_map = {}
@@ -60,14 +84,12 @@ def process_excel_file(file_obj, file_name_str, file_path_str, conn):
             for orig_col_name in row_vals:
                 if orig_col_name == 'NAN': continue
                 
-                # Check against aliases
                 for std_col, aliases in COLUMN_ALIASES.items():
                     if any(alias in orig_col_name for alias in aliases):
                         if std_col not in current_map.values():
                             current_map[orig_col_name] = std_col
                             break
             
-            # A valid header row MUST contain at least a Name and USN
             if 'NAME' in current_map.values() and 'USN' in current_map.values():
                 header_row_index = i
                 actual_cols = [str(x).strip().upper() for x in temp_df.iloc[i].values]
@@ -79,24 +101,16 @@ def process_excel_file(file_obj, file_name_str, file_path_str, conn):
         if header_row_index == -1:
             return False, "Could not identify header row (Missing Name or USN variations)."
             
-        # Re-read with the correct header
         df = pd.read_excel(file_obj, header=header_row_index)
-        
-        # Uppercase all columns to match the map
         df.columns = [str(c).strip().upper() for c in df.columns]
-        
-        # Rename columns to standard format
         df.rename(columns=standardized_rename_map, inplace=True)
         
-        # Handle optional/missing columns by adding them with default values
         for req_col in ['CLASS', 'DATE', 'TIME', 'EVENT']:
             if req_col not in df.columns:
                 df[req_col] = "Not Specified"
                 
-        # Drop rows missing primary identifiers (handles entirely blank rows)
         df = df.dropna(subset=['NAME', 'USN'])
         
-        # Filter Internal Headers: Remove rows where the data itself is just the repeating header name
         df = df[df['NAME'].astype(str).str.strip().str.upper() != 'NAME']
         df = df[~df['USN'].astype(str).str.strip().str.upper().isin(['USN', 'REGISTRATION NUMBER', 'REGISTER NUMBER', 'REG NO'])]
         
@@ -120,7 +134,7 @@ def process_excel_file(file_obj, file_name_str, file_path_str, conn):
                 if cursor.rowcount > 0:
                     records_added += 1
             except sqlite3.Error:
-                pass # Ignored due to UNIQUE constraint
+                pass 
                 
         conn.commit()
         return True, f"Successfully added {records_added} new records."
@@ -129,16 +143,19 @@ def process_excel_file(file_obj, file_name_str, file_path_str, conn):
         return False, f"File Error: {str(e)}"
 
 # -----------------------------------------------------------------------------
-# Streamlit UI
+# Streamlit UI (Authenticated Area)
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title="Attendance Data Manager", layout="wide")
-st.title("Student Attendance & Reimbursement Manager")
+col1, col2 = st.columns([0.9, 0.1])
+with col1:
+    st.title("Student Attendance & Reimbursement Manager")
+with col2:
+    if st.button("Logout"):
+        st.session_state['authenticated'] = False
+        st.rerun()
 
-# Initialize DB on first run
 conn = get_db_connection()
 init_db(conn)
 
-# UI Layout using Tabs
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📂 Folder Scan", 
     "📥 Drag & Drop", 
@@ -156,7 +173,6 @@ with tab1:
         if os.path.isdir(folder_path):
             root_dir = Path(folder_path)
             
-            # Case-insensitive recursive scan that ignores temporary ~$ lock files
             excel_files = [
                 p for p in root_dir.rglob("*") 
                 if p.is_file() and p.suffix.lower() in ['.xlsx', '.xls'] and not p.name.startswith("~$")
@@ -224,21 +240,17 @@ with tab3:
 with tab4:
     st.markdown("### Search by Event or File Name")
     
-    # Fetch unique event names (ignoring defaults)
     df_events = pd.read_sql_query("SELECT DISTINCT event_name FROM attendance WHERE event_name != 'Not Specified'", conn)
     event_list = df_events['event_name'].dropna().tolist()
     
-    # Fetch unique file names
     df_files = pd.read_sql_query("SELECT DISTINCT file_name FROM attendance", conn)
     file_list = df_files['file_name'].dropna().tolist()
     
-    # Combine both lists and remove duplicates
     combined_list = sorted(list(set(event_list + file_list)))
     
     selected_event = st.selectbox("Start typing or select an Event/Reason or File Name:", [""] + combined_list, index=0)
     
     if selected_event:
-        # Search WHERE selected item matches EITHER the event_name OR the file_name
         df_event_results = pd.read_sql_query('''
             SELECT name as Name, usn as USN, class_name as Class, date as Date, time as Time, event_name as Event, file_name as 'File Name', file_path as 'Source Path'
             FROM attendance
@@ -254,7 +266,6 @@ with tab4:
             with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
                 df_event_results.to_excel(writer, index=False, sheet_name='Event Report')
             
-            # Sanitize the file name for download
             safe_filename = "".join([c for c in selected_event if c.isalpha() or c.isdigit() or c==' ']).rstrip()
             
             st.download_button(
@@ -266,7 +277,37 @@ with tab4:
 
 # TAB 5: Reports & Downloads
 with tab5:
-    st.markdown("### Reimbursement Analysis")
+    st.markdown("### 📊 Export Consolidated Database")
+    st.write("Download every single record currently stored in the database as a single Excel file.")
+    
+    # 1. Download ALL DATA button
+    if st.button("Download All Consolidated Data"):
+        all_data_query = '''
+            SELECT name as Name, usn as USN, class_name as Class, date as Date, time as Time, 
+                   event_name as Event, file_name as 'File Name', file_path as 'Source Path'
+            FROM attendance
+            ORDER BY date DESC, name ASC
+        '''
+        df_all = pd.read_sql_query(all_data_query, conn)
+        
+        if not df_all.empty:
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                df_all.to_excel(writer, index=False, sheet_name='All Data')
+            
+            st.download_button(
+                label="📥 Download All Data (Excel)",
+                data=buffer.getvalue(),
+                file_name="All_Consolidated_Data.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        else:
+            st.warning("Database is empty. Please upload data first.")
+            
+    st.markdown("---")
+    
+    # 2. Existing Reimbursement Analysis
+    st.markdown("### 🏆 Reimbursement Analysis")
     st.write("Generate a report of students with the highest number of attendance days.")
     
     if st.button("Generate Reimbursement Report"):
@@ -291,7 +332,7 @@ with tab5:
                 df_report.to_excel(writer, index=False, sheet_name='Reimbursement Report')
             
             st.download_button(
-                label="📥 Download Excel Report",
+                label="📥 Download Reimbursement Report",
                 data=buffer.getvalue(),
                 file_name="Reimbursement_Report.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
