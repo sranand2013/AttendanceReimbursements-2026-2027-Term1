@@ -57,10 +57,10 @@ def init_db(conn):
     conn.commit()
 
 # -----------------------------------------------------------------------------
-# Data Processing Engine
+# Data Processing Engine (UPDATED TO PROCESS ALL SHEETS)
 # -----------------------------------------------------------------------------
 def process_excel_file(file_obj, file_name_str, file_path_str, conn):
-    """Reads the excel file, dynamically maps headers, cleans internal headers, and inserts to DB."""
+    """Reads all sheets in the excel file, dynamically maps headers, cleans internal headers, and inserts to DB."""
     
     COLUMN_ALIASES = {
         'NAME': ['NAME', 'STUDENT NAME', 'FULL NAME', 'STUDENT'],
@@ -72,72 +72,87 @@ def process_excel_file(file_obj, file_name_str, file_path_str, conn):
     }
 
     try:
-        temp_df = pd.read_excel(file_obj, header=None)
+        # sheet_name=None reads ALL sheets into a dictionary: {sheet_name: dataframe}
+        sheets_dict = pd.read_excel(file_obj, header=None, sheet_name=None)
         
-        header_row_index = -1
-        standardized_rename_map = {}
-        
-        for i, row in temp_df.iterrows():
-            row_vals = [str(x).strip().upper() for x in row.values]
-            current_map = {}
-            
-            for orig_col_name in row_vals:
-                if orig_col_name == 'NAN': continue
-                
-                for std_col, aliases in COLUMN_ALIASES.items():
-                    if any(alias in orig_col_name for alias in aliases):
-                        if std_col not in current_map.values():
-                            current_map[orig_col_name] = std_col
-                            break
-            
-            if 'NAME' in current_map.values() and 'USN' in current_map.values():
-                header_row_index = i
-                actual_cols = [str(x).strip().upper() for x in temp_df.iloc[i].values]
-                for col in actual_cols:
-                    if col in current_map:
-                        standardized_rename_map[col] = current_map[col]
-                break
-                
-        if header_row_index == -1:
-            return False, "Could not identify header row (Missing Name or USN variations)."
-            
-        df = pd.read_excel(file_obj, header=header_row_index)
-        df.columns = [str(c).strip().upper() for c in df.columns]
-        df.rename(columns=standardized_rename_map, inplace=True)
-        
-        for req_col in ['CLASS', 'DATE', 'TIME', 'EVENT']:
-            if req_col not in df.columns:
-                df[req_col] = "Not Specified"
-                
-        df = df.dropna(subset=['NAME', 'USN'])
-        
-        df = df[df['NAME'].astype(str).str.strip().str.upper() != 'NAME']
-        df = df[~df['USN'].astype(str).str.strip().str.upper().isin(['USN', 'REGISTRATION NUMBER', 'REGISTER NUMBER', 'REG NO'])]
-        
+        total_records_added = 0
         cursor = conn.cursor()
-        records_added = 0
-        for _, row in df.iterrows():
-            try:
-                cursor.execute('''
-                    INSERT OR IGNORE INTO attendance (name, usn, class_name, date, time, event_name, file_name, file_path)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    str(row['NAME']).strip(), 
-                    str(row['USN']).strip(), 
-                    str(row.get('CLASS', 'Not Specified')).strip(), 
-                    str(row.get('DATE', 'Not Specified')).strip(), 
-                    str(row.get('TIME', 'Not Specified')).strip(), 
-                    str(row.get('EVENT', 'Not Specified')).strip(),
-                    file_name_str,
-                    file_path_str
-                ))
-                if cursor.rowcount > 0:
-                    records_added += 1
-            except sqlite3.Error:
-                pass 
+
+        # Iterate through every sheet in the Excel file
+        for sheet_name, temp_df in sheets_dict.items():
+            if temp_df.empty:
+                continue
                 
+            header_row_index = -1
+            standardized_rename_map = {}
+            
+            # Find the header row for the current sheet
+            for i, row in temp_df.iterrows():
+                row_vals = [str(x).strip().upper() for x in row.values]
+                current_map = {}
+                
+                for orig_col_name in row_vals:
+                    if orig_col_name == 'NAN' or orig_col_name == 'NONE': continue
+                    
+                    for std_col, aliases in COLUMN_ALIASES.items():
+                        if any(alias in orig_col_name for alias in aliases):
+                            if std_col not in current_map.values():
+                                current_map[orig_col_name] = std_col
+                                break
+                
+                # Check if we found both NAME and USN in this row
+                if 'NAME' in current_map.values() and 'USN' in current_map.values():
+                    header_row_index = i
+                    actual_cols = [str(x).strip().upper() for x in temp_df.iloc[i].values]
+                    for col in actual_cols:
+                        if col in current_map:
+                            standardized_rename_map[col] = current_map[col]
+                    break
+                    
+            if header_row_index == -1:
+                continue # Skip sheets that do not contain valid student tables
+                
+            # Slice the dataframe from the header row downwards
+            df = temp_df.iloc[header_row_index + 1:].copy()
+            df.columns = [str(c).strip().upper() for c in temp_df.iloc[header_row_index].values]
+            df.rename(columns=standardized_rename_map, inplace=True)
+            
+            # Fill missing required columns
+            for req_col in ['CLASS', 'DATE', 'TIME', 'EVENT']:
+                if req_col not in df.columns:
+                    df[req_col] = "Not Specified"
+                    
+            # Ensure NAME and USN exist before dropping NAs to prevent KeyError
+            if 'NAME' not in df.columns or 'USN' not in df.columns:
+                continue
+                
+            df = df.dropna(subset=['NAME', 'USN'])
+            df = df[df['NAME'].astype(str).str.strip().str.upper() != 'NAME']
+            df = df[~df['USN'].astype(str).str.strip().str.upper().isin(['USN', 'REGISTRATION NUMBER', 'REGISTER NUMBER', 'REG NO'])]
+            
+            # Insert into database
+            for _, row in df.iterrows():
+                try:
+                    cursor.execute('''
+                        INSERT OR IGNORE INTO attendance (name, usn, class_name, date, time, event_name, file_name, file_path)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        str(row['NAME']).strip(), 
+                        str(row['USN']).strip(), 
+                        str(row.get('CLASS', 'Not Specified')).strip(), 
+                        str(row.get('DATE', 'Not Specified')).strip(), 
+                        str(row.get('TIME', 'Not Specified')).strip(), 
+                        str(row.get('EVENT', 'Not Specified')).strip(),
+                        f"{file_name_str} [{sheet_name}]", # Appends the specific sheet name
+                        file_path_str
+                    ))
+                    if cursor.rowcount > 0:
+                        total_records_added += 1
+                except sqlite3.Error:
+                    pass 
+                    
         conn.commit()
-        return True, f"Successfully added {records_added} new records."
+        return True, f"Processed all sheets. Successfully added {total_records_added} new records."
         
     except Exception as e:
         return False, f"File Error: {str(e)}"
@@ -208,7 +223,7 @@ with tab2:
     uploaded_files = st.file_uploader("Drag and drop files here", type=['xlsx', 'xls'], accept_multiple_files=True)
     
     if st.button("Process Uploaded Files") and uploaded_files:
-        with st.spinner("Processing files..."):
+        with st.spinner("Processing files and all sheets..."):
             for file in uploaded_files:
                 success, msg = process_excel_file(file, file.name, f"Direct Upload: {file.name}", conn)
                 if success:
