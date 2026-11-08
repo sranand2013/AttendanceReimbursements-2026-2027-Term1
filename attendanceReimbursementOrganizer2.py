@@ -36,7 +36,7 @@ if not st.session_state['authenticated']:
 # -----------------------------------------------------------------------------
 # Database Setup (Updated Schema)
 # -----------------------------------------------------------------------------
-def get_db_connection(db_name="attendance_records.db"):
+def get_db_connection(db_name="attendance_records_v2.db"):
     conn = sqlite3.connect(db_name, check_same_thread=False)
     return conn
 
@@ -80,7 +80,6 @@ def expand_extra_data(df):
             except:
                 return {}
         
-        # This converts the stored JSON properties into actual Excel columns
         expanded_df = pd.json_normalize(df['Extra Data'].apply(safe_parse))
         df = pd.concat([df.drop(columns=['Extra Data']), expanded_df], axis=1)
     return df
@@ -89,14 +88,13 @@ def expand_extra_data(df):
 # Data Processing Engine
 # -----------------------------------------------------------------------------
 def process_excel_file(file_obj, file_name_str, file_path_str, file_timestamp, conn):
-    # 1. Group all signatory and teacher variations into a single SIGNATORY bucket
     COLUMN_ALIASES = {
         'NAME': ['NAME', 'STUDENT NAME', 'FULL NAME', 'STUDENT'],
         'USN': ['USN', 'REGISTER NUMBER', 'REGISTRATION NUMBER', 'REG NO', 'ROLL NO', 'REGISTER NO'],
         'CLASS': ['CLASS', 'SECTION', 'SEM AND SEC', 'COURSE', 'PROGRAM', 'BATCH', 'CLASS AND SECTION'],
         'DATE': ['DATE', 'DATES', 'DAY', 'DATE OF REIMBURSEMENT'],
         'TIME': ['TIME', 'TIMINGS', 'TIMING', 'FULLDAY', 'FULL DAY', 'HOURS', 'DURATION', 'SESSION'],
-        'EVENT': ['REASON', 'EVENT', 'EVENT NAME', 'PROGRAMME', 'PURPOSE'],
+        'EVENT': ['REASON', 'EVENT', 'EVENT NAME', 'PROGRAMME', 'PURPOSE', 'REASON FOR'],
         'SIGNATORY': [
             'SIGNATORY', 'SIGNATURE', 'AUTHORISED', 'AUTHORIZED', 'AUTHRISED', 
             'VERIFIED BY', 'APPROVED BY', 'COORDINATOR', 'ASSIGNED TEACHER', 
@@ -104,7 +102,6 @@ def process_excel_file(file_obj, file_name_str, file_path_str, file_timestamp, c
         ]
     }
     
-    # 2. Hardcode the junk fields to completely ignore
     IGNORE_KEYWORDS = [
         'SL.NO', 'S.NO', 'SL NO', 'S.N', 'SL. NO', 'NAN', 
         'TELEPHONE', 'MOBILE', 'PASSPORT', 'FATHER', 'MOTHER', 
@@ -113,13 +110,17 @@ def process_excel_file(file_obj, file_name_str, file_path_str, file_timestamp, c
 
     def is_useful_column(col_name):
         col_upper = str(col_name).strip().upper()
-        # Drop if it matches our ignore list
         if any(kw in col_upper for kw in IGNORE_KEYWORDS):
             return False
-        # Drop generic unnamed pandas columns
         if col_upper.startswith('UNNAMED'):
             return False
         return True
+
+    # Helper functions for auto-correcting swapped Name/USN data
+    def has_numbers(s):
+        return any(c.isdigit() for c in s)
+    def has_letters(s):
+        return any(c.isalpha() for c in s)
 
     try:
         sheets_dict = pd.read_excel(file_obj, header=None, sheet_name=None)
@@ -133,17 +134,26 @@ def process_excel_file(file_obj, file_name_str, file_path_str, file_timestamp, c
             header_row_index = -1
             standardized_rename_map = {}
             
-            # Find the header row
+            # Find the header row using a smarter 2-PASS match system
             for i, row in temp_df.iterrows():
                 row_vals = [str(x).strip().upper() for x in row.values]
                 current_map = {}
                 
+                # PASS 1: Strict EXACT matching (prevents "STUDENT REG NO" mapping to "NAME")
                 for orig_col_name in row_vals:
-                    if orig_col_name == 'NAN' or orig_col_name == 'NONE': continue
-                    
+                    if orig_col_name in ('NAN', 'NONE', ''): continue
                     for std_col, aliases in COLUMN_ALIASES.items():
-                        if any(alias in orig_col_name for alias in aliases):
-                            if std_col not in current_map.values():
+                        if std_col not in current_map.values():
+                            if any(alias == orig_col_name for alias in aliases):
+                                current_map[orig_col_name] = std_col
+                                break
+                
+                # PASS 2: Substring matching (catches leftover messy headers)
+                for orig_col_name in row_vals:
+                    if orig_col_name in ('NAN', 'NONE', '') or orig_col_name in current_map: continue
+                    for std_col, aliases in COLUMN_ALIASES.items():
+                        if std_col not in current_map.values():
+                            if any(alias in orig_col_name for alias in aliases):
                                 current_map[orig_col_name] = std_col
                                 break
                 
@@ -161,14 +171,12 @@ def process_excel_file(file_obj, file_name_str, file_path_str, file_timestamp, c
             df = temp_df.iloc[header_row_index + 1:].copy()
             df.columns = [str(c).strip().upper() for c in temp_df.iloc[header_row_index].values]
             
-            # FIX: Remove duplicate columns to prevent "The truth value of a Series is ambiguous" errors
+            # Remove duplicate columns to prevent pandas crashes
             df = df.loc[:, ~df.columns.duplicated()].copy()
             
-            # 3. Drop columns where more than 90% of the data is missing (empty junk fields)
             threshold = max(1, int(0.1 * len(df)))
             df.dropna(axis=1, thresh=threshold, inplace=True)
             
-            # Identify columns that are NOT part of the standard mapping AND are considered useful
             extra_columns = [col for col in df.columns if col not in standardized_rename_map and is_useful_column(col)]
             
             df.rename(columns=standardized_rename_map, inplace=True)
@@ -185,9 +193,15 @@ def process_excel_file(file_obj, file_name_str, file_path_str, file_timestamp, c
             df = df[~df['USN'].astype(str).str.strip().str.upper().isin(['USN', 'REGISTRATION NUMBER', 'REGISTER NUMBER', 'REG NO'])]
             
             for _, row in df.iterrows():
+                name_val = str(row['NAME']).strip()
+                usn_val = str(row['USN']).strip()
+                
+                # SMART AUTO-CORRECT: If Name has numbers and USN has only letters, they were typed in the wrong columns!
+                if has_numbers(name_val) and not has_numbers(usn_val) and has_letters(usn_val):
+                    name_val, usn_val = usn_val, name_val # Swap them back to correct order
+                
                 extra_data_dict = {col: row[col] for col in extra_columns if pd.notna(row[col]) and str(row[col]).strip() != ""}
                 
-                # If ANY of the signatory variants were found, assign them to a clean, unified "Authorized Signatory" field
                 if 'SIGNATORY' in df.columns and pd.notna(row.get('SIGNATORY')) and str(row['SIGNATORY']).strip() != "":
                     extra_data_dict['Authorized Signatory'] = str(row['SIGNATORY']).strip()
                     
@@ -201,8 +215,8 @@ def process_excel_file(file_obj, file_name_str, file_path_str, file_timestamp, c
                         )
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
-                        str(row['NAME']).strip(), 
-                        str(row['USN']).strip(), 
+                        name_val, 
+                        usn_val, 
                         str(row.get('CLASS', 'Not Specified')).strip(), 
                         str(row.get('DATE', 'Not Specified')).strip(), 
                         str(row.get('TIME', 'Not Specified')).strip(), 
@@ -276,14 +290,12 @@ with tab1:
                     
                     success, msg = process_excel_file(file_path, file_path.name, rel_path, sys_timestamp, conn)
                     
-                    # Consider skipped if it fails OR if 0 records were added
                     if success and "Added 0 new records" not in msg:
                         success_count += 1
                     else:
                         reason = msg if not success else "File processed but contained no valid matching student records."
                         st.warning(f"Skipped {file_path.name}: {reason}")
                         
-                        # Log to the skipped_files table
                         try:
                             conn.cursor().execute('''
                                 INSERT OR REPLACE INTO skipped_files (
@@ -387,7 +399,6 @@ with tab5:
     st.write("Download every single record currently stored in the database, ordered by the latest received files.")
     
     if st.button("Download All Consolidated Data"):
-        # Enforces strict sorting by timestamp (descending)
         all_data_query = '''
             SELECT name as Name, usn as USN, class_name as Class, date as Date, time as Time, 
                    event_name as Event, file_name as 'File Name', file_path as 'Source Path',
