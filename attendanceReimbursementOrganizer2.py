@@ -36,7 +36,7 @@ if not st.session_state['authenticated']:
 # -----------------------------------------------------------------------------
 # Database Setup (Updated Schema)
 # -----------------------------------------------------------------------------
-def get_db_connection(db_name="attendance_records_v2.db"):
+def get_db_connection(db_name="attendance_records.db"):
     conn = sqlite3.connect(db_name, check_same_thread=False)
     return conn
 
