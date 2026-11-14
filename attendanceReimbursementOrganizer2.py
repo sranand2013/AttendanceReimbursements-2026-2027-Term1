@@ -25,7 +25,7 @@ if not st.session_state['authenticated']:
         submit = st.form_submit_button("Login")
         
         if submit:
-            if username == "admin" and password == "xyz1234":
+            if username == "admin" and password == "padaseva@1234":
                 st.session_state['authenticated'] = True
                 st.rerun()
             else:
