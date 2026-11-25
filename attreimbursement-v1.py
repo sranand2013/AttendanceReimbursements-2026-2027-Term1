@@ -4,6 +4,7 @@ import libsql_client
 import os
 from pathlib import Path
 import io
+import zipfile
 
 # -----------------------------------------------------------------------------
 # Page & Authentication Setup
@@ -74,10 +75,10 @@ def get_available_terms(client):
     return df_terms['term'].tolist() if not df_terms.empty else []
 
 # -----------------------------------------------------------------------------
-# Data Processing Engine (Batch Inserts for Fast Cloud Performance)
+# Data Processing Engine (Batch Upserts for Fast Cloud Performance)
 # -----------------------------------------------------------------------------
 def process_excel_file(file_obj, file_name_str, file_path_str, default_term, client):
-    """Reads all sheets, maps headers dynamically, assigns Term, and batch-inserts to Turso."""
+    """Reads all sheets, maps headers dynamically, assigns Term, and batch-upserts to Turso."""
     
     COLUMN_ALIASES = {
         'NAME': ['NAME', 'STUDENT NAME', 'FULL NAME', 'STUDENT'],
@@ -155,7 +156,7 @@ def process_excel_file(file_obj, file_name_str, file_path_str, default_term, cli
                 statements.append(
                     libsql_client.Statement(
                         '''
-                        INSERT OR IGNORE INTO attendance_reimbursement 
+                        INSERT OR REPLACE INTO attendance_reimbursement 
                         (name, usn, class_name, date, time, event_name, term, file_name, file_path)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ''',
@@ -173,14 +174,13 @@ def process_excel_file(file_obj, file_name_str, file_path_str, default_term, cli
                     )
                 )
 
-        # Send all inserts in chunks of 100 over HTTP to avoid round-trip latency
-        total_records_added = 0
+        total_records_processed = 0
         chunk_size = 100
         for idx in range(0, len(statements), chunk_size):
             batch_results = client.batch(statements[idx:idx + chunk_size])
-            total_records_added += sum(res.rows_affected for res in batch_results)
+            total_records_processed += sum(res.rows_affected for res in batch_results)
 
-        return True, f"Processed all sheets. Successfully added {total_records_added} new records under '{default_term}'."
+        return True, f"Processed all sheets. Synced {total_records_processed} records under '{default_term}'."
         
     except Exception as e:
         return False, f"File Error: {str(e)}"
@@ -203,7 +203,7 @@ existing_terms = get_available_terms(client)
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📂 Folder Scan", 
-    "📥 Drag & Drop", 
+    "📥 Drag & Drop (Files / ZIP)", 
     "🔍 Student Query",
     "📅 Event Search",
     "📊 Reports & Downloads"
@@ -214,7 +214,8 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 # -----------------------------------------------------------------------------
 with tab1:
     st.markdown("### Scan Local Directory Recursively")
-    st.info("Note: Local folder paths work when running locally. On Streamlit Cloud, use **Drag & Drop**.")
+    st.info("Note: Local folder paths work when running Streamlit on your local computer. If using the Streamlit Cloud URL, zip your folder and upload it in **Drag & Drop**.")
+    
     col_t1_a, col_t1_b = st.columns([0.4, 0.6])
     with col_t1_a:
         scan_term = st.text_input("Academic Term (e.g., 2026-27 Term1):", value="2026-27 Term1", key="scan_term")
@@ -222,22 +223,24 @@ with tab1:
         folder_path = st.text_input("Absolute root folder path (e.g., C:/Data/Attendance):")
     
     if st.button("Start Folder Scan"):
+        clean_path = folder_path.strip().strip('"').strip("'")
         if not scan_term.strip():
             st.error("Please enter an Academic Term before scanning.")
-        elif os.path.isdir(folder_path):
-            root_dir = Path(folder_path)
+        elif clean_path and os.path.isdir(clean_path):
+            root_dir = Path(clean_path)
             excel_files = [
                 p for p in root_dir.rglob("*") 
                 if p.is_file() and p.suffix.lower() in ['.xlsx', '.xls'] and not p.name.startswith("~$")
             ]
             
             if not excel_files:
-                st.warning("No Excel files found.")
+                st.warning("No Excel files found in the specified folder.")
             else:
                 progress_text = st.empty()
                 bar = st.progress(0)
                 total_files = len(excel_files)
                 success_count = 0
+                scan_logs = []
                 
                 for i, file_path in enumerate(excel_files):
                     rel_path = str(file_path.relative_to(root_dir))
@@ -245,34 +248,81 @@ with tab1:
                     if success:
                         success_count += 1
                     else:
-                        st.warning(f"Skipped {file_path.name}: {msg}")
+                        scan_logs.append((False, f"Skipped {file_path.name}: {msg}"))
                         
                     progress_text.text(f"Processing {i+1}/{total_files}: {file_path.name}")
                     bar.progress((i + 1) / total_files)
                     
-                st.success(f"Scan complete for {scan_term}! Processed {success_count} valid files.")
+                scan_logs.insert(0, (True, f"Scan complete for {scan_term}! Processed {success_count}/{total_files} valid files."))
+                st.session_state["scan_messages"] = scan_logs
+                st.rerun()
         else:
-            st.error("Invalid directory path.")
+            st.error(f"Invalid directory path: `{clean_path}`. Ensure the path exists on the machine running Streamlit, or use **Drag & Drop** with a `.zip` file.")
+
+    if "scan_messages" in st.session_state:
+        for success, text in st.session_state.pop("scan_messages"):
+            if success:
+                st.success(text)
+            else:
+                st.warning(text)
 
 # -----------------------------------------------------------------------------
-# TAB 2: Drag and Drop Upload
+# TAB 2: Drag and Drop Upload (Supports Multiple Excel Files & Nested ZIP Folders)
 # -----------------------------------------------------------------------------
 with tab2:
-    st.markdown("### Upload Individual Excel Files")
+    st.markdown("### Upload Excel Files or Zipped Folders")
     upload_term = st.text_input("Academic Term (e.g., 2026-27 Term1):", value="2026-27 Term1", key="upload_term")
-    uploaded_files = st.file_uploader("Drag and drop files here", type=['xlsx', 'xls'], accept_multiple_files=True)
+    uploaded_files = st.file_uploader(
+        "Drag and drop Excel files (.xlsx, .xls) or a compressed folder (.zip) here", 
+        type=['xlsx', 'xls', 'zip'], 
+        accept_multiple_files=True
+    )
     
     if st.button("Process Uploaded Files") and uploaded_files:
         if not upload_term.strip():
             st.error("Please enter an Academic Term before uploading.")
         else:
-            with st.spinner(f"Processing files for {upload_term} and uploading to Turso..."):
+            with st.spinner(f"Processing files for {upload_term} and syncing with Turso..."):
+                messages = []
                 for file in uploaded_files:
-                    success, msg = process_excel_file(file, file.name, f"Direct Upload: {file.name}", upload_term, client)
-                    if success:
-                        st.success(f"{file.name}: {msg}")
+                    if file.name.lower().endswith(".zip"):
+                        try:
+                            with zipfile.ZipFile(file) as z:
+                                excel_entries = [
+                                    info for info in z.infolist()
+                                    if not info.is_dir()
+                                    and info.filename.lower().endswith(('.xlsx', '.xls'))
+                                    and not Path(info.filename).name.startswith("~$")
+                                ]
+                                if not excel_entries:
+                                    messages.append((False, f"{file.name}: No Excel files found inside ZIP."))
+                                for zip_info in excel_entries:
+                                    with z.open(zip_info) as excel_bytes:
+                                        file_data = io.BytesIO(excel_bytes.read())
+                                        clean_name = Path(zip_info.filename).name
+                                        success, msg = process_excel_file(
+                                            file_data,
+                                            clean_name,
+                                            f"ZIP: {file.name}/{zip_info.filename}",
+                                            upload_term,
+                                            client
+                                        )
+                                        messages.append((success, f"{zip_info.filename}: {msg}"))
+                        except zipfile.BadZipFile:
+                            messages.append((False, f"{file.name}: Invalid or corrupted ZIP file."))
                     else:
-                        st.error(f"{file.name}: Failed - {msg}")
+                        success, msg = process_excel_file(file, file.name, f"Direct Upload: {file.name}", upload_term, client)
+                        messages.append((success, f"{file.name}: {msg}"))
+                        
+                st.session_state["upload_messages"] = messages
+                st.rerun()
+
+    if "upload_messages" in st.session_state:
+        for success, text in st.session_state.pop("upload_messages"):
+            if success:
+                st.success(text)
+            else:
+                st.error(text)
 
 # -----------------------------------------------------------------------------
 # TAB 3: Student Query (Term-Wise)
