@@ -1,517 +1,136 @@
-import streamlit as st
 import pandas as pd
 import libsql_client
-import os
 from pathlib import Path
-import io
-import zipfile
 
-# -----------------------------------------------------------------------------
-# Page & Authentication Setup
-# -----------------------------------------------------------------------------
-st.set_page_config(page_title="Attendance & Reimbursement Manager", layout="wide")
+# 1. Configure your Turso credentials and local folder
+TURSO_URL = "https://eshaaletursocmslb-<your-org>.turso.io"
+TURSO_AUTH_TOKEN = "your-turso-auth-token-here"
 
-if 'authenticated' not in st.session_state:
-    st.session_state['authenticated'] = False
+LOCAL_FOLDER = r"C:\Users\ANAND.ANAND-PC\Desktop\CMS Data\1sem 2026\Reimbursement Related\Attendance Reimbursement Folder 2026 Term 1"
+ACADEMIC_TERM = "2026-27 Term1"
 
-if not st.session_state['authenticated']:
-    st.title("🔒 Login Required")
-    st.write("Please enter your credentials to access the Attendance Manager.")
-    
-    with st.form("login_form"):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submit = st.form_submit_button("Login")
-        
-        if submit:
-            if username == "admin" and password == "xyz1234":
-                st.session_state['authenticated'] = True
-                st.rerun()
-            else:
-                st.error("Invalid username or password.")
-                
-    st.stop()
+COLUMN_ALIASES = {
+    'NAME': ['NAME', 'STUDENT NAME', 'FULL NAME', 'STUDENT'],
+    'USN': ['USN', 'REGISTER NUMBER', 'REGISTRATION NUMBER', 'REG NO', 'ROLL NO', 'REGISTER NO'],
+    'CLASS': ['CLASS', 'SECTION', 'SEM AND SEC', 'COURSE', 'PROGRAM', 'BATCH', 'CLASS AND SECTION'],
+    'DATE': ['DATE', 'DATES', 'DAY', 'DATE OF REIMBURSEMENT'],
+    'TIME': ['TIME', 'TIMINGS', 'TIMING', 'FULLDAY', 'FULL DAY', 'HOURS', 'DURATION', 'SESSION'],
+    'EVENT': ['REASON', 'EVENT', 'EVENT NAME', 'PROGRAMME', 'PURPOSE'],
+    'TERM': ['TERM', 'ACADEMIC TERM', 'SEMESTER TERM']
+}
 
-# -----------------------------------------------------------------------------
-# Turso Database Setup (eshaaletursocmslb via libsql-client)
-# -----------------------------------------------------------------------------
-@st.cache_resource
-def get_turso_client():
-    """Creates a cached synchronous HTTP client for Turso DB 'eshaaletursocmslb'."""
-    url = st.secrets["turso"]["url"].replace("libsql://", "https://")
-    auth_token = st.secrets["turso"]["auth_token"]
-    return libsql_client.create_client_sync(url=url, auth_token=auth_token)
+def sync_local_folder():
+    root_dir = Path(LOCAL_FOLDER)
+    if not root_dir.is_dir():
+        print(f"Error: Folder not found -> {LOCAL_FOLDER}")
+        return
 
-def init_db(client):
+    client = libsql_client.create_client_sync(url=TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
     client.execute('''
         CREATE TABLE IF NOT EXISTS attendance_reimbursement (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            usn TEXT,
-            class_name TEXT,
-            date TEXT,
-            time TEXT,
-            event_name TEXT,
-            term TEXT,
-            file_name TEXT,
-            file_path TEXT,
+            name TEXT, usn TEXT, class_name TEXT, date TEXT,
+            time TEXT, event_name TEXT, term TEXT, file_name TEXT, file_path TEXT,
             UNIQUE(usn, date, time, event_name, term)
         )
     ''')
 
-def run_select_query(client, query, params=None):
-    """Executes a SELECT query on Turso and returns a Pandas DataFrame."""
-    rs = client.execute(query, params or [])
-    if not rs.rows:
-        return pd.DataFrame(columns=list(rs.columns))
-    return pd.DataFrame([list(row) for row in rs.rows], columns=list(rs.columns))
+    excel_files = [
+        p for p in root_dir.rglob("*")
+        if p.is_file() and p.suffix.lower() in ['.xlsx', '.xls'] and not p.name.startswith("~$")
+    ]
+    print(f"Found {len(excel_files)} Excel files. Scanning and syncing to Turso...")
 
-def get_available_terms(client):
-    """Fetches distinct terms from the database for UI dropdowns."""
-    df_terms = run_select_query(
-        client, 
-        "SELECT DISTINCT term FROM attendance_reimbursement WHERE term IS NOT NULL AND term != '' ORDER BY term DESC"
-    )
-    return df_terms['term'].tolist() if not df_terms.empty else []
+    statements = []
+    for file_path in excel_files:
+        rel_path = str(file_path.relative_to(root_dir))
+        try:
+            sheets_dict = pd.read_excel(file_path, header=None, sheet_name=None)
+            for sheet_name, temp_df in sheets_dict.items():
+                if temp_df.empty:
+                    continue
 
-# -----------------------------------------------------------------------------
-# Data Processing Engine (Batch Upserts for Fast Cloud Performance)
-# -----------------------------------------------------------------------------
-def process_excel_file(file_obj, file_name_str, file_path_str, default_term, client):
-    """Reads all sheets, maps headers dynamically, assigns Term, and batch-upserts to Turso."""
-    
-    COLUMN_ALIASES = {
-        'NAME': ['NAME', 'STUDENT NAME', 'FULL NAME', 'STUDENT'],
-        'USN': ['USN', 'REGISTER NUMBER', 'REGISTRATION NUMBER', 'REG NO', 'ROLL NO', 'REGISTER NO'],
-        'CLASS': ['CLASS', 'SECTION', 'SEM AND SEC', 'COURSE', 'PROGRAM', 'BATCH', 'CLASS AND SECTION'],
-        'DATE': ['DATE', 'DATES', 'DAY', 'DATE OF REIMBURSEMENT'],
-        'TIME': ['TIME', 'TIMINGS', 'TIMING', 'FULLDAY', 'FULL DAY', 'HOURS', 'DURATION', 'SESSION'],
-        'EVENT': ['REASON', 'EVENT', 'EVENT NAME', 'PROGRAMME', 'PURPOSE'],
-        'TERM': ['TERM', 'ACADEMIC TERM', 'SEMESTER TERM']
-    }
+                header_row_index = -1
+                standardized_rename_map = {}
 
-    try:
-        sheets_dict = pd.read_excel(file_obj, header=None, sheet_name=None)
-        statements = []
+                for i, row in temp_df.iterrows():
+                    row_vals = [str(x).strip().upper() for x in row.values]
+                    current_map = {}
+                    for orig_col_name in row_vals:
+                        if orig_col_name in ('NAN', 'NONE', ''):
+                            continue
+                        for std_col, aliases in COLUMN_ALIASES.items():
+                            if any(alias in orig_col_name for alias in aliases):
+                                if std_col not in current_map.values():
+                                    current_map[orig_col_name] = std_col
+                                    break
+                    if 'NAME' in current_map.values() and 'USN' in current_map.values():
+                        header_row_index = i
+                        actual_cols = [str(x).strip().upper() for x in temp_df.iloc[i].values]
+                        for col in actual_cols:
+                            if col in current_map:
+                                standardized_rename_map[col] = current_map[col]
+                        break
 
-        for sheet_name, temp_df in sheets_dict.items():
-            if temp_df.empty:
-                continue
-                
-            header_row_index = -1
-            standardized_rename_map = {}
-            
-            for i, row in temp_df.iterrows():
-                row_vals = [str(x).strip().upper() for x in row.values]
-                current_map = {}
-                
-                for orig_col_name in row_vals:
-                    if orig_col_name in ('NAN', 'NONE', ''):
-                        continue
-                    
-                    for std_col, aliases in COLUMN_ALIASES.items():
-                        if any(alias in orig_col_name for alias in aliases):
-                            if std_col not in current_map.values():
-                                current_map[orig_col_name] = std_col
-                                break
-                
-                if 'NAME' in current_map.values() and 'USN' in current_map.values():
-                    header_row_index = i
-                    actual_cols = [str(x).strip().upper() for x in temp_df.iloc[i].values]
-                    for col in actual_cols:
-                        if col in current_map:
-                            standardized_rename_map[col] = current_map[col]
-                    break
-                    
-            if header_row_index == -1:
-                continue
-                
-            df = temp_df.iloc[header_row_index + 1:].copy()
-            df.columns = [str(c).strip().upper() for c in temp_df.iloc[header_row_index].values]
-            df.rename(columns=standardized_rename_map, inplace=True)
-            
-            for req_col in ['CLASS', 'DATE', 'TIME', 'EVENT']:
-                if req_col not in df.columns:
-                    df[req_col] = "Not Specified"
-            
-            if 'TERM' not in df.columns:
-                df['TERM'] = default_term.strip()
-            else:
-                df['TERM'] = df['TERM'].fillna(default_term.strip())
-                
-            if 'NAME' not in df.columns or 'USN' not in df.columns:
-                continue
-                
-            df = df.dropna(subset=['NAME', 'USN'])
-            df = df[df['NAME'].astype(str).str.strip().str.upper() != 'NAME']
-            df = df[~df['USN'].astype(str).str.strip().str.upper().isin(
-                ['USN', 'REGISTRATION NUMBER', 'REGISTER NUMBER', 'REG NO']
-            )]
-            
-            for _, row in df.iterrows():
-                row_term = str(row.get('TERM', default_term)).strip()
-                if not row_term or row_term.upper() in ('NAN', 'NONE'):
-                    row_term = default_term.strip()
+                if header_row_index == -1:
+                    continue
 
-                statements.append(
-                    libsql_client.Statement(
-                        '''
-                        INSERT OR REPLACE INTO attendance_reimbursement 
-                        (name, usn, class_name, date, time, event_name, term, file_name, file_path)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ''',
-                        [
-                            str(row['NAME']).strip(), 
-                            str(row['USN']).strip(), 
-                            str(row.get('CLASS', 'Not Specified')).strip(), 
-                            str(row.get('DATE', 'Not Specified')).strip(), 
-                            str(row.get('TIME', 'Not Specified')).strip(), 
-                            str(row.get('EVENT', 'Not Specified')).strip(),
-                            row_term,
-                            f"{file_name_str} [{sheet_name}]",
-                            file_path_str
-                        ]
+                df = temp_df.iloc[header_row_index + 1:].copy()
+                df.columns = [str(c).strip().upper() for c in temp_df.iloc[header_row_index].values]
+                df.rename(columns=standardized_rename_map, inplace=True)
+
+                for req_col in ['CLASS', 'DATE', 'TIME', 'EVENT']:
+                    if req_col not in df.columns:
+                        df[req_col] = "Not Specified"
+                if 'TERM' not in df.columns:
+                    df['TERM'] = ACADEMIC_TERM
+                else:
+                    df['TERM'] = df['TERM'].fillna(ACADEMIC_TERM)
+
+                if 'NAME' not in df.columns or 'USN' not in df.columns:
+                    continue
+
+                df = df.dropna(subset=['NAME', 'USN'])
+                df = df[df['NAME'].astype(str).str.strip().str.upper() != 'NAME']
+                df = df[~df['USN'].astype(str).str.strip().str.upper().isin(
+                    ['USN', 'REGISTRATION NUMBER', 'REGISTER NUMBER', 'REG NO']
+                )]
+
+                for _, row in df.iterrows():
+                    row_term = str(row.get('TERM', ACADEMIC_TERM)).strip()
+                    if not row_term or row_term.upper() in ('NAN', 'NONE'):
+                        row_term = ACADEMIC_TERM
+
+                    statements.append(
+                        libsql_client.Statement(
+                            '''
+                            INSERT OR REPLACE INTO attendance_reimbursement
+                            (name, usn, class_name, date, time, event_name, term, file_name, file_path)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ''',
+                            [
+                                str(row['NAME']).strip(),
+                                str(row['USN']).strip(),
+                                str(row.get('CLASS', 'Not Specified')).strip(),
+                                str(row.get('DATE', 'Not Specified')).strip(),
+                                str(row.get('TIME', 'Not Specified')).strip(),
+                                str(row.get('EVENT', 'Not Specified')).strip(),
+                                row_term,
+                                f"{file_path.name} [{sheet_name}]",
+                                rel_path
+                            ]
+                        )
                     )
-                )
+            print(f"Parsed: {rel_path}")
+        except Exception as e:
+            print(f"Skipped {file_path.name}: {e}")
 
-        total_records_processed = 0
-        chunk_size = 100
-        for idx in range(0, len(statements), chunk_size):
-            batch_results = client.batch(statements[idx:idx + chunk_size])
-            total_records_processed += sum(res.rows_affected for res in batch_results)
+    total_synced = 0
+    for idx in range(0, len(statements), 100):
+        results = client.batch(statements[idx:idx + 100])
+        total_synced += sum(r.rows_affected for r in results)
 
-        return True, f"Processed all sheets. Synced {total_records_processed} records under '{default_term}'."
-        
-    except Exception as e:
-        return False, f"File Error: {str(e)}"
+    print(f"\nDone! Synced {total_synced} records to Turso. Refresh your Streamlit Cloud app to view them.")
 
-# -----------------------------------------------------------------------------
-# Streamlit UI (Authenticated Area)
-# -----------------------------------------------------------------------------
-col1, col2 = st.columns([0.9, 0.1])
-with col1:
-    st.title("Student Attendance & Reimbursement Manager")
-    st.caption("Connected to Turso Database: `eshaaletursocmslb` | Table: `attendance_reimbursement`")
-with col2:
-    if st.button("Logout"):
-        st.session_state['authenticated'] = False
-        st.rerun()
-
-client = get_turso_client()
-init_db(client)
-existing_terms = get_available_terms(client)
-
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📂 Folder Scan", 
-    "📥 Drag & Drop (Files / ZIP)", 
-    "🔍 Student Query",
-    "📅 Event Search",
-    "📊 Reports & Downloads"
-])
-
-# -----------------------------------------------------------------------------
-# TAB 1: Recursive Folder Scan (Local Execution)
-# -----------------------------------------------------------------------------
-with tab1:
-    st.markdown("### Scan Local Directory Recursively")
-    st.info("Note: Local folder paths work when running Streamlit on your local computer. If using the Streamlit Cloud URL, zip your folder and upload it in **Drag & Drop**.")
-    
-    col_t1_a, col_t1_b = st.columns([0.4, 0.6])
-    with col_t1_a:
-        scan_term = st.text_input("Academic Term (e.g., 2026-27 Term1):", value="2026-27 Term1", key="scan_term")
-    with col_t1_b:
-        folder_path = st.text_input("Absolute root folder path (e.g., C:/Data/Attendance):")
-    
-    if st.button("Start Folder Scan"):
-        clean_path = folder_path.strip().strip('"').strip("'")
-        if not scan_term.strip():
-            st.error("Please enter an Academic Term before scanning.")
-        elif clean_path and os.path.isdir(clean_path):
-            root_dir = Path(clean_path)
-            excel_files = [
-                p for p in root_dir.rglob("*") 
-                if p.is_file() and p.suffix.lower() in ['.xlsx', '.xls'] and not p.name.startswith("~$")
-            ]
-            
-            if not excel_files:
-                st.warning("No Excel files found in the specified folder.")
-            else:
-                progress_text = st.empty()
-                bar = st.progress(0)
-                total_files = len(excel_files)
-                success_count = 0
-                scan_logs = []
-                
-                for i, file_path in enumerate(excel_files):
-                    rel_path = str(file_path.relative_to(root_dir))
-                    success, msg = process_excel_file(file_path, file_path.name, rel_path, scan_term, client)
-                    if success:
-                        success_count += 1
-                    else:
-                        scan_logs.append((False, f"Skipped {file_path.name}: {msg}"))
-                        
-                    progress_text.text(f"Processing {i+1}/{total_files}: {file_path.name}")
-                    bar.progress((i + 1) / total_files)
-                    
-                scan_logs.insert(0, (True, f"Scan complete for {scan_term}! Processed {success_count}/{total_files} valid files."))
-                st.session_state["scan_messages"] = scan_logs
-                st.rerun()
-        else:
-            st.error(f"Invalid directory path: `{clean_path}`. Ensure the path exists on the machine running Streamlit, or use **Drag & Drop** with a `.zip` file.")
-
-    if "scan_messages" in st.session_state:
-        for success, text in st.session_state.pop("scan_messages"):
-            if success:
-                st.success(text)
-            else:
-                st.warning(text)
-
-# -----------------------------------------------------------------------------
-# TAB 2: Drag and Drop Upload (Supports Multiple Excel Files & Nested ZIP Folders)
-# -----------------------------------------------------------------------------
-with tab2:
-    st.markdown("### Upload Excel Files or Zipped Folders")
-    upload_term = st.text_input("Academic Term (e.g., 2026-27 Term1):", value="2026-27 Term1", key="upload_term")
-    uploaded_files = st.file_uploader(
-        "Drag and drop Excel files (.xlsx, .xls) or a compressed folder (.zip) here", 
-        type=['xlsx', 'xls', 'zip'], 
-        accept_multiple_files=True
-    )
-    
-    if st.button("Process Uploaded Files") and uploaded_files:
-        if not upload_term.strip():
-            st.error("Please enter an Academic Term before uploading.")
-        else:
-            with st.spinner(f"Processing files for {upload_term} and syncing with Turso..."):
-                messages = []
-                for file in uploaded_files:
-                    if file.name.lower().endswith(".zip"):
-                        try:
-                            with zipfile.ZipFile(file) as z:
-                                excel_entries = [
-                                    info for info in z.infolist()
-                                    if not info.is_dir()
-                                    and info.filename.lower().endswith(('.xlsx', '.xls'))
-                                    and not Path(info.filename).name.startswith("~$")
-                                ]
-                                if not excel_entries:
-                                    messages.append((False, f"{file.name}: No Excel files found inside ZIP."))
-                                for zip_info in excel_entries:
-                                    with z.open(zip_info) as excel_bytes:
-                                        file_data = io.BytesIO(excel_bytes.read())
-                                        clean_name = Path(zip_info.filename).name
-                                        success, msg = process_excel_file(
-                                            file_data,
-                                            clean_name,
-                                            f"ZIP: {file.name}/{zip_info.filename}",
-                                            upload_term,
-                                            client
-                                        )
-                                        messages.append((success, f"{zip_info.filename}: {msg}"))
-                        except zipfile.BadZipFile:
-                            messages.append((False, f"{file.name}: Invalid or corrupted ZIP file."))
-                    else:
-                        success, msg = process_excel_file(file, file.name, f"Direct Upload: {file.name}", upload_term, client)
-                        messages.append((success, f"{file.name}: {msg}"))
-                        
-                st.session_state["upload_messages"] = messages
-                st.rerun()
-
-    if "upload_messages" in st.session_state:
-        for success, text in st.session_state.pop("upload_messages"):
-            if success:
-                st.success(text)
-            else:
-                st.error(text)
-
-# -----------------------------------------------------------------------------
-# TAB 3: Student Query (Term-Wise)
-# -----------------------------------------------------------------------------
-with tab3:
-    st.markdown("### Lookup Student Records")
-    col_q1, col_q2 = st.columns([0.7, 0.3])
-    with col_q1:
-        search_term = st.text_input("Enter Student Name or USN:")
-    with col_q2:
-        selected_query_term = st.selectbox("Filter by Term:", ["All Terms"] + existing_terms, key="query_term_filter")
-    
-    if search_term:
-        like_pattern = f"%{search_term}%"
-        if selected_query_term == "All Terms":
-            df_results = run_select_query(client, '''
-                SELECT term as Term, name as Name, usn as USN, class_name as Class, 
-                       date as Date, time as Time, event_name as Event, 
-                       file_name as 'File Name', file_path as 'Source Path' 
-                FROM attendance_reimbursement 
-                WHERE name LIKE ? OR usn LIKE ?
-                ORDER BY term DESC, date DESC
-            ''', [like_pattern, like_pattern])
-        else:
-            df_results = run_select_query(client, '''
-                SELECT term as Term, name as Name, usn as USN, class_name as Class, 
-                       date as Date, time as Time, event_name as Event, 
-                       file_name as 'File Name', file_path as 'Source Path' 
-                FROM attendance_reimbursement 
-                WHERE (name LIKE ? OR usn LIKE ?) AND term = ?
-                ORDER BY date DESC
-            ''', [like_pattern, like_pattern, selected_query_term])
-        
-        if not df_results.empty:
-            st.dataframe(df_results, use_container_width=True)
-            st.info(f"Total entries found: {len(df_results)}")
-        else:
-            st.warning("No records found.")
-
-# -----------------------------------------------------------------------------
-# TAB 4: Event Search (Term-Wise)
-# -----------------------------------------------------------------------------
-with tab4:
-    st.markdown("### Search by Event or File Name")
-    selected_event_term = st.selectbox("Filter Events by Term:", ["All Terms"] + existing_terms, key="event_term_filter")
-    
-    if selected_event_term == "All Terms":
-        df_events = run_select_query(client, "SELECT DISTINCT event_name FROM attendance_reimbursement WHERE event_name != 'Not Specified'")
-        df_files = run_select_query(client, "SELECT DISTINCT file_name FROM attendance_reimbursement")
-    else:
-        df_events = run_select_query(client, "SELECT DISTINCT event_name FROM attendance_reimbursement WHERE event_name != 'Not Specified' AND term = ?", [selected_event_term])
-        df_files = run_select_query(client, "SELECT DISTINCT file_name FROM attendance_reimbursement WHERE term = ?", [selected_event_term])
-        
-    event_list = df_events['event_name'].dropna().tolist() if not df_events.empty else []
-    file_list = df_files['file_name'].dropna().tolist() if not df_files.empty else []
-    combined_list = sorted(list(set(event_list + file_list)))
-    
-    selected_event = st.selectbox("Start typing or select an Event/Reason or File Name:", [""] + combined_list, index=0)
-    
-    if selected_event:
-        if selected_event_term == "All Terms":
-            df_event_results = run_select_query(client, '''
-                SELECT term as Term, name as Name, usn as USN, class_name as Class, 
-                       date as Date, time as Time, event_name as Event, 
-                       file_name as 'File Name', file_path as 'Source Path'
-                FROM attendance_reimbursement
-                WHERE event_name = ? OR file_name = ?
-                ORDER BY term DESC, date DESC, name ASC
-            ''', [selected_event, selected_event])
-        else:
-            df_event_results = run_select_query(client, '''
-                SELECT term as Term, name as Name, usn as USN, class_name as Class, 
-                       date as Date, time as Time, event_name as Event, 
-                       file_name as 'File Name', file_path as 'Source Path'
-                FROM attendance_reimbursement
-                WHERE (event_name = ? OR file_name = ?) AND term = ?
-                ORDER BY date DESC, name ASC
-            ''', [selected_event, selected_event, selected_event_term])
-        
-        if not df_event_results.empty:
-            st.dataframe(df_event_results, use_container_width=True)
-            st.info(f"Total students found for '{selected_event}' ({selected_event_term}): {len(df_event_results)}")
-            
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                df_event_results.to_excel(writer, index=False, sheet_name='Event Report')
-            
-            safe_filename = "".join([c for c in selected_event if c.isalpha() or c.isdigit() or c == ' ']).rstrip()
-            term_tag = selected_event_term.replace(" ", "_")
-            
-            st.download_button(
-                label=f"📥 Download '{selected_event}' Report ({selected_event_term})",
-                data=buffer.getvalue(),
-                file_name=f"Event_Report_{term_tag}_{safe_filename[:20]}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-
-# -----------------------------------------------------------------------------
-# TAB 5: Term-Wise Reports & Downloads
-# -----------------------------------------------------------------------------
-with tab5:
-    st.markdown("### 📊 Export Consolidated Database (Term-Wise)")
-    selected_report_term = st.selectbox(
-        "Select Term for Reports:", 
-        ["All Terms"] + existing_terms, 
-        key="report_term_filter"
-    )
-    
-    # 1. Consolidated Data Download
-    if selected_report_term == "All Terms":
-        df_all = run_select_query(client, '''
-            SELECT term as Term, name as Name, usn as USN, class_name as Class, 
-                   date as Date, time as Time, event_name as Event, 
-                   file_name as 'File Name', file_path as 'Source Path'
-            FROM attendance_reimbursement
-            ORDER BY term DESC, date DESC, name ASC
-        ''')
-    else:
-        df_all = run_select_query(client, '''
-            SELECT term as Term, name as Name, usn as USN, class_name as Class, 
-                   date as Date, time as Time, event_name as Event, 
-                   file_name as 'File Name', file_path as 'Source Path'
-            FROM attendance_reimbursement
-            WHERE term = ?
-            ORDER BY date DESC, name ASC
-        ''', [selected_report_term])
-        
-    if not df_all.empty:
-        buffer_all = io.BytesIO()
-        with pd.ExcelWriter(buffer_all, engine='xlsxwriter') as writer:
-            df_all.to_excel(writer, index=False, sheet_name='Consolidated Data')
-        
-        term_slug = selected_report_term.replace(" ", "_")
-        st.download_button(
-            label=f"📥 Download Consolidated Data ({selected_report_term} - {len(df_all)} rows)",
-            data=buffer_all.getvalue(),
-            file_name=f"Consolidated_Data_{term_slug}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-    else:
-        st.warning(f"No records found for {selected_report_term}.")
-            
-    st.markdown("---")
-    
-    # 2. Term-Wise Reimbursement Analysis
-    st.markdown("### 🏆 Term-Wise Reimbursement Analysis")
-    st.write("Summary of student reimbursement days and total session entries for the selected term.")
-    
-    if selected_report_term == "All Terms":
-        df_report = run_select_query(client, '''
-            SELECT 
-                term as Term,
-                usn as USN,
-                MAX(name) as Name,
-                MAX(class_name) as Class,
-                COUNT(DISTINCT date) as "Reimbursement Days Allowed",
-                COUNT(id) as "Total Session Entries"
-            FROM attendance_reimbursement
-            GROUP BY term, usn
-            ORDER BY term DESC, "Reimbursement Days Allowed" DESC, "Total Session Entries" DESC
-        ''')
-    else:
-        df_report = run_select_query(client, '''
-            SELECT 
-                term as Term,
-                usn as USN,
-                MAX(name) as Name,
-                MAX(class_name) as Class,
-                COUNT(DISTINCT date) as "Reimbursement Days Allowed",
-                COUNT(id) as "Total Session Entries"
-            FROM attendance_reimbursement
-            WHERE term = ?
-            GROUP BY term, usn
-            ORDER BY "Reimbursement Days Allowed" DESC, "Total Session Entries" DESC
-        ''', [selected_report_term])
-        
-    if not df_report.empty:
-        st.dataframe(df_report, use_container_width=True)
-        
-        buffer_rep = io.BytesIO()
-        with pd.ExcelWriter(buffer_rep, engine='xlsxwriter') as writer:
-            df_report.to_excel(writer, index=False, sheet_name='Reimbursement Report')
-        
-        term_slug = selected_report_term.replace(" ", "_")
-        st.download_button(
-            label=f"📥 Download Reimbursement Report ({selected_report_term})",
-            data=buffer_rep.getvalue(),
-            file_name=f"Reimbursement_Report_{term_slug}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-    else:
-        st.warning(f"No reimbursement records available for {selected_report_term}.")
+if __name__ == "__main__":
+    sync_local_folder()
