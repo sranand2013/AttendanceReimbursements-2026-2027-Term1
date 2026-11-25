@@ -83,11 +83,13 @@ def get_available_terms(client):
     return df_terms['term'].tolist() if not df_terms.empty else []
 
 # -----------------------------------------------------------------------------
-# 3. Data Processing Engine (Batch Upserts for Fast Cloud Performance)
+# 3. Data Processing Engine (Returns explicit status: 'processed', 'skipped', 'error')
 # -----------------------------------------------------------------------------
 def process_excel_file(file_obj, file_name_str, file_path_str, default_term, client):
-    """Reads all sheets, maps headers dynamically, assigns Term, and batch-upserts to Turso."""
-    
+    """
+    Reads all sheets, maps headers dynamically, assigns Term, and batch-upserts to Turso.
+    Returns: (status, records_count, message) where status in {'processed', 'skipped', 'error'}
+    """
     COLUMN_ALIASES = {
         'NAME': ['NAME', 'STUDENT NAME', 'FULL NAME', 'STUDENT'],
         'USN': ['USN', 'REGISTER NUMBER', 'REGISTRATION NUMBER', 'REG NO', 'ROLL NO', 'REGISTER NO'],
@@ -100,6 +102,8 @@ def process_excel_file(file_obj, file_name_str, file_path_str, default_term, cli
 
     try:
         sheets_dict = pd.read_excel(file_obj, header=None, sheet_name=None)
+        total_sheets = len(sheets_dict)
+        valid_sheets = 0
         statements = []
 
         for sheet_name, temp_df in sheets_dict.items():
@@ -156,6 +160,10 @@ def process_excel_file(file_obj, file_name_str, file_path_str, default_term, cli
                 ['USN', 'REGISTRATION NUMBER', 'REGISTER NUMBER', 'REG NO']
             )]
             
+            if df.empty:
+                continue
+
+            valid_sheets += 1
             for _, row in df.iterrows():
                 row_term = str(row.get('TERM', default_term)).strip()
                 if not row_term or row_term.upper() in ('NAN', 'NONE'):
@@ -182,16 +190,19 @@ def process_excel_file(file_obj, file_name_str, file_path_str, default_term, cli
                     )
                 )
 
+        if not statements:
+            return "skipped", 0, f"Skipped (no valid Name/USN student rows found across {total_sheets} sheet(s))."
+
         total_records_processed = 0
         chunk_size = 100
         for idx in range(0, len(statements), chunk_size):
             batch_results = client.batch(statements[idx:idx + chunk_size])
             total_records_processed += sum(res.rows_affected for res in batch_results)
 
-        return True, f"Processed all sheets. Synced {total_records_processed} records under '{default_term}'."
+        return "processed", total_records_processed, f"Synced {total_records_processed} records from {valid_sheets}/{total_sheets} sheet(s)."
         
     except Exception as e:
-        return False, f"File Error: {str(e)}"
+        return "error", 0, f"Error reading file: {str(e)}"
 
 # -----------------------------------------------------------------------------
 # 4. Streamlit UI (Authenticated Area)
@@ -223,7 +234,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 ])
 
 # -----------------------------------------------------------------------------
-# TAB 1: Drag and Drop Upload (Supports Multiple Excel Files & Nested ZIP Folders)
+# TAB 1: Drag and Drop Upload (Detailed Scan & Skip Reporting)
 # -----------------------------------------------------------------------------
 with tab1:
     st.markdown("### Upload Excel Files or Zipped Folders")
@@ -238,47 +249,125 @@ with tab1:
         if not upload_term.strip():
             st.error("Please enter an Academic Term before uploading.")
         else:
-            with st.spinner(f"Processing files for {upload_term} and syncing with Turso..."):
-                messages = []
-                for file in uploaded_files:
-                    if file.name.lower().endswith(".zip"):
-                        try:
-                            with zipfile.ZipFile(file) as z:
-                                excel_entries = [
-                                    info for info in z.infolist()
-                                    if not info.is_dir()
-                                    and info.filename.lower().endswith(('.xlsx', '.xls'))
-                                    and not Path(info.filename).name.startswith("~$")
-                                ]
-                                if not excel_entries:
-                                    messages.append((False, f"{file.name}: No Excel files found inside ZIP."))
-                                for zip_info in excel_entries:
+            progress_text = st.empty()
+            progress_bar = st.progress(0)
+
+            # Collect all candidate items first so we have exact total counts
+            excel_tasks = []       # (display_path, clean_name, file_bytes_or_obj)
+            ignored_non_excel = [] # (display_path, reason)
+            zip_errors = []
+
+            for file in uploaded_files:
+                if file.name.lower().endswith(".zip"):
+                    try:
+                        with zipfile.ZipFile(file) as z:
+                            all_entries = [info for info in z.infolist() if not info.is_dir()]
+                            for zip_info in all_entries:
+                                entry_name = Path(zip_info.filename).name
+                                # Ignore macOS metadata folders or Excel lock files
+                                if zip_info.filename.startswith("__MACOSX/") or entry_name.startswith("~$"):
+                                    ignored_non_excel.append((f"{file.name}/{zip_info.filename}", "Temporary/system metadata file ignored"))
+                                elif zip_info.filename.lower().endswith(('.xlsx', '.xls')):
                                     with z.open(zip_info) as excel_bytes:
-                                        file_data = io.BytesIO(excel_bytes.read())
-                                        clean_name = Path(zip_info.filename).name
-                                        success, msg = process_excel_file(
-                                            file_data,
-                                            clean_name,
-                                            f"ZIP: {file.name}/{zip_info.filename}",
-                                            upload_term,
-                                            client
-                                        )
-                                        messages.append((success, f"{zip_info.filename}: {msg}"))
-                        except zipfile.BadZipFile:
-                            messages.append((False, f"{file.name}: Invalid or corrupted ZIP file."))
+                                        excel_tasks.append((
+                                            f"{file.name}/{zip_info.filename}",
+                                            entry_name,
+                                            io.BytesIO(excel_bytes.read())
+                                        ))
+                                else:
+                                    ignored_non_excel.append((f"{file.name}/{zip_info.filename}", "Non-Excel file ignored"))
+                    except zipfile.BadZipFile:
+                        zip_errors.append((file.name, "Invalid or corrupted ZIP archive"))
+                else:
+                    if file.name.startswith("~$"):
+                        ignored_non_excel.append((file.name, "Temporary Excel lock file ignored"))
                     else:
-                        success, msg = process_excel_file(file, file.name, f"Direct Upload: {file.name}", upload_term, client)
-                        messages.append((success, f"{file.name}: {msg}"))
-                        
-                st.session_state["upload_messages"] = messages
+                        excel_tasks.append((f"Direct Upload: {file.name}", file.name, file))
+
+            total_excel_files = len(excel_tasks)
+            processed_logs = []
+            skipped_logs = list(ignored_non_excel)
+            error_logs = list(zip_errors)
+            total_records_synced = 0
+
+            if total_excel_files == 0:
+                progress_bar.empty()
+                progress_text.empty()
+                st.session_state["upload_report"] = {
+                    "term": upload_term,
+                    "total_excel": 0,
+                    "processed": [],
+                    "skipped": skipped_logs,
+                    "errors": error_logs,
+                    "total_records": 0
+                }
                 st.rerun()
 
-    if "upload_messages" in st.session_state:
-        for success, text in st.session_state.pop("upload_messages"):
-            if success:
-                st.success(text)
-            else:
-                st.error(text)
+            for idx, (display_path, clean_name, file_obj) in enumerate(excel_tasks):
+                progress_text.text(f"Scanning Excel file {idx + 1} of {total_excel_files}: {clean_name}")
+                status, rec_count, msg = process_excel_file(
+                    file_obj, clean_name, display_path, upload_term, client
+                )
+                if status == "processed":
+                    processed_logs.append((display_path, msg))
+                    total_records_synced += rec_count
+                elif status == "skipped":
+                    skipped_logs.append((display_path, msg))
+                else:
+                    error_logs.append((display_path, msg))
+
+                progress_bar.progress((idx + 1) / total_excel_files)
+
+            progress_text.empty()
+            progress_bar.empty()
+
+            st.session_state["upload_report"] = {
+                "term": upload_term,
+                "total_excel": total_excel_files,
+                "processed": processed_logs,
+                "skipped": skipped_logs,
+                "errors": error_logs,
+                "total_records": total_records_synced
+            }
+            st.rerun()
+
+    # Render Persistent Scan Summary Report after rerun
+    if "upload_report" in st.session_state:
+        rep = st.session_state["upload_report"]
+        p_count = len(rep["processed"])
+        s_count = len(rep["skipped"])
+        e_count = len(rep["errors"])
+        t_excel = rep["total_excel"]
+
+        st.markdown(f"#### 📋 Scan Summary for `{rep['term']}`")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Excel Files Scanned", f"{p_count + e_count} / {t_excel}")
+        m2.metric("Files Imported", p_count)
+        m3.metric("Skipped / Ignored", s_count)
+        m4.metric("Records Synced", rep["total_records"])
+
+        if p_count > 0:
+            st.success(f"Successfully imported **{p_count} out of {t_excel}** Excel files ({rep['total_records']} total student entries synced).")
+
+        if s_count > 0:
+            st.warning(f"**{s_count} file(s) were skipped or ignored.** Expand below to inspect which files were skipped and why.")
+
+        if e_count > 0:
+            st.error(f"**{e_count} file(s) failed due to errors.** Expand below for details.")
+
+        with st.expander("🔍 View Detailed File-by-File Scan Log", expanded=(s_count > 0 or e_count > 0)):
+            if rep["errors"]:
+                st.markdown("**❌ Failed Files:**")
+                for fname, reason in rep["errors"]:
+                    st.write(f"- `{fname}` — {reason}")
+            if rep["skipped"]:
+                st.markdown("**⚠️ Skipped / Ignored Files:**")
+                for fname, reason in rep["skipped"]:
+                    st.write(f"- `{fname}` — {reason}")
+            if rep["processed"]:
+                st.markdown("**✅ Processed Excel Files:**")
+                for fname, reason in rep["processed"]:
+                    st.write(f"- `{fname}` — {reason}")
 
 # -----------------------------------------------------------------------------
 # TAB 2: Recursive Folder Scan (For Local Machine Execution Only)
@@ -299,43 +388,64 @@ with tab2:
             st.error("Please enter an Academic Term before scanning.")
         elif clean_path and os.path.isdir(clean_path):
             root_dir = Path(clean_path)
-            excel_files = [
-                p for p in root_dir.rglob("*") 
-                if p.is_file() and p.suffix.lower() in ['.xlsx', '.xls'] and not p.name.startswith("~$")
-            ]
-            
+            all_files = [p for p in root_dir.rglob("*") if p.is_file()]
+            excel_files = []
+            skipped_local = []
+
+            for p in all_files:
+                rel_p = str(p.relative_to(root_dir))
+                if p.name.startswith("~$"):
+                    skipped_local.append((rel_p, "Temporary Excel lock file ignored"))
+                elif p.suffix.lower() in ['.xlsx', '.xls']:
+                    excel_files.append((p, rel_p))
+                else:
+                    skipped_local.append((rel_p, "Non-Excel file ignored"))
+
             if not excel_files:
-                st.warning("No Excel files found in the specified folder.")
+                st.warning(f"No Excel files found in the specified folder ({len(skipped_local)} non-Excel files ignored).")
             else:
                 progress_text = st.empty()
                 bar = st.progress(0)
                 total_files = len(excel_files)
-                success_count = 0
-                scan_logs = []
+                processed_local = []
+                error_local = []
+                total_recs = 0
                 
-                for i, file_path in enumerate(excel_files):
-                    rel_path = str(file_path.relative_to(root_dir))
-                    success, msg = process_excel_file(file_path, file_path.name, rel_path, scan_term, client)
-                    if success:
-                        success_count += 1
+                for i, (file_path, rel_path) in enumerate(excel_files):
+                    status, rec_count, msg = process_excel_file(file_path, file_path.name, rel_path, scan_term, client)
+                    if status == "processed":
+                        processed_local.append((rel_path, msg))
+                        total_recs += rec_count
+                    elif status == "skipped":
+                        skipped_local.append((rel_path, msg))
                     else:
-                        scan_logs.append((False, f"Skipped {file_path.name}: {msg}"))
+                        error_local.append((rel_path, msg))
                         
                     progress_text.text(f"Processing {i+1}/{total_files}: {file_path.name}")
                     bar.progress((i + 1) / total_files)
                     
-                scan_logs.insert(0, (True, f"Scan complete for {scan_term}! Processed {success_count}/{total_files} valid files."))
-                st.session_state["scan_messages"] = scan_logs
+                st.session_state["local_scan_report"] = {
+                    "term": scan_term,
+                    "total_excel": total_files,
+                    "processed": processed_local,
+                    "skipped": skipped_local,
+                    "errors": error_local,
+                    "total_records": total_recs
+                }
                 st.rerun()
         else:
             st.error(f"Invalid directory path: `{clean_path}`. Ensure the path exists on the machine running Streamlit, or upload a `.zip` file in Tab 1.")
 
-    if "scan_messages" in st.session_state:
-        for success, text in st.session_state.pop("scan_messages"):
-            if success:
-                st.success(text)
-            else:
-                st.warning(text)
+    if "local_scan_report" in st.session_state:
+        rep = st.session_state["local_scan_report"]
+        st.success(f"Scanned {len(rep['processed'])}/{rep['total_excel']} Excel files ({rep['total_records']} records synced). Skipped/Ignored: {len(rep['skipped'])}.")
+        with st.expander("View Local Scan Log", expanded=len(rep["skipped"]) > 0):
+            for fname, reason in rep["skipped"]:
+                st.write(f"- ⚠️ `{fname}` — {reason}")
+            for fname, reason in rep["errors"]:
+                st.write(f"- ❌ `{fname}` — {reason}")
+            for fname, reason in rep["processed"]:
+                st.write(f"- ✅ `{fname}` — {reason}")
 
 # -----------------------------------------------------------------------------
 # TAB 3: Student Query (Term-Wise)
